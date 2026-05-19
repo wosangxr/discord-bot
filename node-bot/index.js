@@ -3,6 +3,10 @@ const { createCanvas, loadImage } = require('canvas');
 const axios = require('axios');
 const { Pool } = require('pg');
 const path = require('path');
+const { GoogleGenAI } = require('@google/genai');
+
+// Initialize Gemini AI (Ensure GEMINI_API_KEY is set in .env)
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // ============================================================
 // Global Error Handlers — ป้องกันบอทดับจาก Unhandled Errors
@@ -137,8 +141,8 @@ async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) 
     // 2. ตำแหน่ง Avatar — จัดให้ตรงกับกรอบวงกลมในรูป Background
     // Welcome: วงกลมเงินอยู่กลาง-บน | Goodbye: วงกลมขาวอยู่กลาง-บน
     const avatarX = type === 'welcome' ? 500 : 500;
-    const avatarY = type === 'welcome' ? 175 : 170;
-    const avatarR = type === 'welcome' ? 80 : 90;
+const avatarY = type === 'welcome' ? 170 : 170;
+const avatarR = type === 'welcome' ? 130 : 130;
 
     if (avatarUrl) {
         try {
@@ -236,14 +240,165 @@ client.on(Events.GuildMemberRemove, async member => {
     }
 });
 
+// ============================================================
+// Fuzzy Matching — รองรับการพิมพ์ผิดเล็กน้อยสำหรับคำสั่งภาษาไทย
+// ============================================================
+
+/**
+ * คำนวณ Levenshtein Distance ระหว่างสอง string
+ * ยิ่งค่าน้อย = ยิ่งคล้ายกัน
+ */
+function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            dp[i][j] = a[i - 1] === b[j - 1]
+                ? dp[i - 1][j - 1]
+                : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+        }
+    }
+    return dp[m][n];
+}
+
+/**
+ * ตรวจสอบว่า input ตรงหรือคล้ายกับคำสั่งที่กำหนดหรือไม่
+ * @param {string} input - คำสั่งที่ผู้ใช้พิมพ์ (เฉพาะส่วนคำสั่ง ไม่รวม args)
+ * @param {string[]} commands - รายการคำสั่งที่ถูกต้อง
+ * @param {number} threshold - จำนวนตัวอักษรที่ยอมให้พิมพ์ผิดได้ (default: 2)
+ * @returns {string|null} คำสั่งที่ match หรือ null
+ */
+function fuzzyMatch(input, commands, threshold = 2) {
+    // 1. Exact match ก่อน
+    const exact = commands.find(cmd => input === cmd);
+    if (exact) return exact;
+
+    // 2. Fuzzy match — หาคำสั่งที่คล้ายที่สุด
+    let bestMatch = null;
+    let bestDist = Infinity;
+    for (const cmd of commands) {
+        const dist = levenshtein(input, cmd);
+        if (dist < bestDist && dist <= threshold) {
+            bestDist = dist;
+            bestMatch = cmd;
+        }
+    }
+    return bestMatch;
+}
+
+/**
+ * แยกคำสั่งออกจาก args โดยจับคู่กับรายการคำสั่งที่รู้จัก
+ * รองรับทั้ง exact match และ fuzzy match
+ */
+function parseCommand(content) {
+    if (!content.startsWith('/')) return { command: null, args: '', isFuzzy: false };
+
+    // คำสั่งทั้งหมดที่รู้จัก (เรียงจากยาวไปสั้นเพื่อ match ยาวสุดก่อน)
+    const allCommands = [
+        '/สภาพอากาศ',
+        '/ช่วยเหลือ',
+        '/testwelcome',
+        '/testgoodbye',
+        '/weather',
+        '/อากาศ',
+        '/help',
+        '/ช่วย',
+        '/ping',
+        '/tts',
+        '/ask',
+        '/ถาม',
+    ];
+
+    // ลอง exact startsWith ก่อน (เรียงจากยาวไปสั้น)
+    const sorted = [...allCommands].sort((a, b) => b.length - a.length);
+    for (const cmd of sorted) {
+        if (content.startsWith(cmd)) {
+            const rest = content.slice(cmd.length).trim();
+            return { command: cmd, args: rest, isFuzzy: false };
+        }
+    }
+
+    // ไม่เจอ exact → ลอง fuzzy match (ตัดที่ space แรก)
+    const spaceIdx = content.indexOf(' ');
+    const inputCmd = spaceIdx === -1 ? content : content.slice(0, spaceIdx);
+    const inputArgs = spaceIdx === -1 ? '' : content.slice(spaceIdx + 1).trim();
+
+    const matched = fuzzyMatch(inputCmd, allCommands, 2);
+    if (matched) {
+        return { command: matched, args: inputArgs, isFuzzy: true };
+    }
+
+    return { command: null, args: '', isFuzzy: false };
+}
+
 // --- Commands ---
 client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
 
-    // Weather Command
-    if (message.content.startsWith('!weather')) {
-        const args = message.content.split(' ').slice(1);
-        if (args.length === 0) return message.reply('🌦️ Please provide a city name (e.g., `!weather Bangkok`)');
+    // AI Mention Handle — ถ้ามีคน tag บอท จะให้ AI ตอบเลย
+    if (message.mentions.has(client.user) && !message.mentions.everyone) {
+        // ลบ tag บอทออกจากข้อความ
+        const prompt = message.content.replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '').trim();
+        if (prompt) {
+            try {
+                await message.channel.sendTyping();
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: `You are a helpful and friendly Discord bot. Keep your answers concise, well-formatted, and suitable for Discord.
+User asked: ${prompt}`
+                });
+                return message.reply(response.text);
+            } catch (error) {
+                console.error('Gemini AI Error:', error);
+                return message.reply('❌ ขออภัย ระบบ AI ขัดข้องชั่วคราว');
+            }
+        }
+    }
+
+    const { command, args: cmdArgs, isFuzzy } = parseCommand(message.content);
+    if (!command) return; // ไม่ใช่คำสั่งที่รู้จัก
+
+    // AI Command — /ask | /ถาม
+    const askCmds = ['/ask', '/ถาม'];
+    if (askCmds.includes(command)) {
+        const prompt = cmdArgs;
+        if (!prompt) return message.reply('🧠 พิมพ์คำถามที่ต้องการถามได้เลย (เช่น `/ถาม แนะนำเมนูอาหารเย็นหน่อย`)');
+
+        try {
+            await message.channel.sendTyping();
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: `You are a helpful and friendly Discord bot. Keep your answers concise, well-formatted, and suitable for Discord.
+User asked: ${prompt}`
+            });
+            return message.reply(response.text);
+        } catch (error) {
+            console.error('Gemini AI Error:', error);
+            return message.reply('❌ ขออภัย ระบบ AI ขัดข้องชั่วคราว');
+        }
+    }
+
+    // Weather Command — /weather (English) | /สภาพอากาศ, /อากาศ (Thai)
+    const weatherThaiCmds = ['/สภาพอากาศ', '/อากาศ'];
+    const isWeatherEN = command === '/weather';
+    const isWeatherTH = weatherThaiCmds.includes(command);
+    if (isWeatherEN || isWeatherTH) {
+        const isThai = isWeatherTH;
+        const args = cmdArgs.split(/\s+/).filter(Boolean);
+
+        // แจ้งเมื่อ fuzzy match สำเร็จ
+        if (isFuzzy) {
+            await message.channel.send(`💡 คุณหมายถึง \`${command}\` ใช่ไหม? ดำเนินการให้เลย~`);
+        }
+
+        if (args.length === 0) {
+            return message.reply(isThai
+                ? '🌦️ กรุณาระบุชื่อเมือง เช่น `/สภาพอากาศ กรุงเทพ` หรือ `/อากาศ กรุงเทพ`'
+                : '🌦️ Please provide a city name (e.g., `/weather Bangkok`)'
+            );
+        }
 
         const city = args.join(' ');
         try {
@@ -251,35 +406,70 @@ client.on(Events.MessageCreate, async message => {
                 params: {
                     q: city,
                     appid: process.env.WEATHER_API_KEY,
-                    units: 'metric'
+                    units: 'metric',
+                    lang: isThai ? 'th' : 'en'
                 }
             });
             const w = response.data;
+
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', hour12: false });
+            const dateStr = isThai
+                ? `วันนี้ เวลา ${timeStr}`
+                : `Today at ${timeStr}`;
+
             const embed = {
                 color: 0x0099ff,
-                title: `🌤️ Weather in ${w.name}, ${w.sys.country}`,
+                title: isThai
+                    ? `🌤️ สภาพอากาศใน ${w.name}, ${w.sys.country}`
+                    : `🌤️ Weather in ${w.name}, ${w.sys.country}`,
                 fields: [
-                    { name: '🌡️ Temperature', value: `${w.main.temp}°C (feels like ${w.main.feels_like}°C)`, inline: true },
-                    { name: '💧 Humidity', value: `${w.main.humidity}%`, inline: true },
-                    { name: '💨 Wind', value: `${w.wind.speed} m/s`, inline: true },
-                    { name: '☁️ Condition', value: w.weather[0].description, inline: true },
+                    {
+                        name: isThai ? '🌡️ อุณหภูมิ' : '🌡️ Temperature',
+                        value: isThai
+                            ? `${w.main.temp}°C (รู้สึกเหมือน ${w.main.feels_like}°C)`
+                            : `${w.main.temp}°C (feels like ${w.main.feels_like}°C)`,
+                        inline: true
+                    },
+                    {
+                        name: isThai ? '💧 ความชื้น' : '💧 Humidity',
+                        value: `${w.main.humidity}%`,
+                        inline: true
+                    },
+                    {
+                        name: isThai ? '💨 ลม' : '💨 Wind',
+                        value: `${w.wind.speed} m/s`,
+                        inline: true
+                    },
+                    {
+                        name: isThai ? '☁️ สภาพอากาศ' : '☁️ Condition',
+                        value: w.weather[0].description,
+                        inline: true
+                    },
                 ],
+                footer: { text: dateStr },
                 timestamp: new Date().toISOString(),
             };
             message.reply({ embeds: [embed] });
         } catch (error) {
             if (error.response && error.response.status === 404) {
-                message.reply('❌ City not found. Please check the name and try again.');
+                message.reply(isThai
+                    ? '❌ ไม่พบเมืองนี้ กรุณาตรวจสอบชื่อแล้วลองใหม่อีกครั้ง'
+                    : '❌ City not found. Please check the name and try again.'
+                );
             } else {
-                message.reply('⚠️ Could not fetch weather data. Please try again later.');
+                message.reply(isThai
+                    ? '⚠️ ไม่สามารถดึงข้อมูลสภาพอากาศได้ กรุณาลองใหม่ภายหลัง'
+                    : '⚠️ Could not fetch weather data. Please try again later.'
+                );
             }
         }
     }
 
     // TTS Command (Sending task to Python Worker)
-    if (message.content.startsWith('!tts')) {
-        const text = message.content.replace('!tts', '').trim();
-        if (!text) return message.reply('🔊 Please provide text to speak (e.g., `!tts สวัสดีครับ`)');
+    if (command === '/tts') {
+        const text = cmdArgs;
+        if (!text) return message.reply('🔊 Please provide text to speak (e.g., `/tts สวัสดีครับ`)');
 
         try {
             await message.channel.sendTyping();
@@ -303,7 +493,7 @@ client.on(Events.MessageCreate, async message => {
     }
 
     // Test Welcome Command
-    if (message.content === '!testwelcome') {
+    if (command === '/testwelcome') {
         try {
             const channel = findWelcomeChannel(message.guild);
             if (!channel) return message.reply('⚠️ ไม่พบห้อง Welcome! ตั้งค่า WELCOME_CHANNEL_ID ใน .env');
@@ -327,7 +517,7 @@ client.on(Events.MessageCreate, async message => {
     }
 
     // Test Goodbye Command
-    if (message.content === '!testgoodbye') {
+    if (command === '/testgoodbye') {
         try {
             const channel = findWelcomeChannel(message.guild);
             if (!channel) return message.reply('⚠️ ไม่พบห้อง Welcome! ตั้งค่า WELCOME_CHANNEL_ID ใน .env');
@@ -350,18 +540,30 @@ client.on(Events.MessageCreate, async message => {
         }
     }
 
-    // Help Command
-    if (message.content === '!help') {
+    // Help Command — /help | /ช่วยเหลือ | /ช่วย
+    const helpCmds = ['/help', '/ช่วยเหลือ', '/ช่วย'];
+    if (helpCmds.includes(command)) {
+        const isThai = command !== '/help';
+
+        if (isFuzzy) {
+            await message.channel.send(`💡 คุณหมายถึง \`${command}\` ใช่ไหม? ดำเนินการให้เลย~`);
+        }
+
         const embed = {
             color: 0xe94560,
-            title: '📖 Bot Commands',
+            title: isThai ? '📖 คำสั่งบอท' : '📖 Bot Commands',
+            description: isThai
+                ? '*💡 พิมพ์ผิดเล็กน้อยก็ไม่เป็นไร บอทเข้าใจได้!*'
+                : '*💡 Typo-tolerant — minor typos are auto-corrected!*',
             fields: [
-                { name: '!weather <city>', value: 'Get current weather for a city' },
-                { name: '!tts <text>', value: 'Convert text to speech (supports Thai)' },
-                { name: '!testwelcome', value: 'Test the welcome image' },
-                { name: '!testgoodbye', value: 'Test the goodbye image' },
-                { name: '!ping', value: 'Check bot latency' },
-                { name: '!help', value: 'Show this help message' },
+                { name: '/ask <คำถาม> | /ถาม', value: isThai ? 'ถามคำถามกับ AI (หรือแท็กชื่อบอทเพื่อคุยได้เลย)' : 'Ask a question to AI (Or tag the bot directly)' },
+                { name: '/weather <city>', value: isThai ? 'ดูสภาพอากาศ (ตอบเป็นภาษาอังกฤษ)' : 'Get current weather for a city (English)' },
+                { name: '/สภาพอากาศ <เมือง>  (/อากาศ)', value: isThai ? 'ดูสภาพอากาศ (ตอบเป็นภาษาไทย)' : 'Get current weather for a city (Thai)' },
+                { name: '/tts <text>', value: isThai ? 'แปลงข้อความเป็นเสียงพูด (รองรับภาษาไทย)' : 'Convert text to speech (supports Thai)' },
+                { name: '/testwelcome', value: isThai ? 'ทดสอบรูปต้อนรับ' : 'Test the welcome image' },
+                { name: '/testgoodbye', value: isThai ? 'ทดสอบรูปลาก่อน' : 'Test the goodbye image' },
+                { name: '/ping', value: isThai ? 'เช็คความหน่วงของบอท' : 'Check bot latency' },
+                { name: '/help | /ช่วยเหลือ | /ช่วย', value: isThai ? 'แสดงข้อความช่วยเหลือนี้' : 'Show this help message' },
             ],
             footer: { text: 'Discord Utility Bot v1.0' },
         };
@@ -369,7 +571,7 @@ client.on(Events.MessageCreate, async message => {
     }
 
     // Ping Command
-    if (message.content === '!ping') {
+    if (command === '/ping') {
         const sent = await message.reply('🏓 Pinging...');
         sent.edit(`🏓 Pong! Latency: **${sent.createdTimestamp - message.createdTimestamp}ms** | API: **${Math.round(client.ws.ping)}ms**`);
     }

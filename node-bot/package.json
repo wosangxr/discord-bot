@@ -8,6 +8,7 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
+    "@google/genai": "^2.4.0",
     "axios": "^1.6.0",
     "canvas": "^2.11.2",
     "discord.js": "^14.14.1",

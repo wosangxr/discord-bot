@@ -346,13 +346,15 @@ client.on(Events.MessageCreate, async message => {
                 await message.channel.sendTyping();
                 const response = await ai.models.generateContent({
                     model: 'gemini-2.5-flash',
-                    contents: `You are a helpful and friendly Discord bot. Keep your answers concise, well-formatted, and suitable for Discord.
-User asked: ${prompt}`
+                    contents: `You are a helpful and friendly Discord bot. Keep your answers concise, well-formatted, and suitable for Discord.\nUser asked: ${prompt}`,
+                    config: {
+                        tools: [{ googleSearch: {} }]
+                    }
                 });
                 return message.reply(response.text);
             } catch (error) {
                 console.error('Gemini AI Error:', error);
-                return message.reply('❌ ขออภัย ระบบ AI ขัดข้องชั่วคราว');
+                return message.reply(`❌ ขออภัย ระบบ AI ขัดข้องชั่วคราว: ${error.message || 'Unknown Error'}`);
             }
         }
     }
@@ -370,13 +372,15 @@ User asked: ${prompt}`
             await message.channel.sendTyping();
             const response = await ai.models.generateContent({
                 model: 'gemini-2.5-flash',
-                contents: `You are a helpful and friendly Discord bot. Keep your answers concise, well-formatted, and suitable for Discord.
-User asked: ${prompt}`
+                contents: `You are a helpful and friendly Discord bot. Keep your answers concise, well-formatted, and suitable for Discord.\nUser asked: ${prompt}`,
+                config: {
+                    tools: [{ googleSearch: {} }]
+                }
             });
             return message.reply(response.text);
         } catch (error) {
             console.error('Gemini AI Error:', error);
-            return message.reply('❌ ขออภัย ระบบ AI ขัดข้องชั่วคราว');
+            return message.reply(`❌ ขออภัย ระบบ AI ขัดข้องชั่วคราว: ${error.message || 'Unknown Error'}`);
         }
     }
 

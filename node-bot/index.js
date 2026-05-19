@@ -1,0 +1,475 @@
+const { Client, GatewayIntentBits, AttachmentBuilder, Events } = require('discord.js');
+const { createCanvas, loadImage } = require('canvas');
+const axios = require('axios');
+const { Pool } = require('pg');
+const path = require('path');
+
+// ============================================================
+// Global Error Handlers — ป้องกันบอทดับจาก Unhandled Errors
+// ============================================================
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
+    // ไม่ exit — ให้บอทรันต่อไป
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('💥 Uncaught Exception:', error);
+    // ไม่ exit — ให้บอทรันต่อไป (docker restart จะจัดการถ้าจำเป็น)
+});
+
+// ============================================================
+// Discord Client Setup
+// ============================================================
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+    ],
+});
+
+// ============================================================
+// PostgreSQL Connection — พร้อม Retry Logic
+// ============================================================
+const pool = new Pool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    // Connection pool settings เพื่อลดการใช้ RAM บน e2-micro
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+});
+
+// Handle pool-level errors so they don't crash the process
+pool.on('error', (err) => {
+    console.error('⚠️ PostgreSQL Pool Error (idle client):', err.message);
+});
+
+/**
+ * รอจนกว่า PostgreSQL จะพร้อม — ลองเชื่อมต่อซ้ำทุก 3 วินาที
+ */
+async function waitForDatabase(maxRetries = 10) {
+    for (let i = 1; i <= maxRetries; i++) {
+        try {
+            const res = await pool.query('SELECT NOW()');
+            console.log(`✅ Database connected! Server time: ${res.rows[0].now}`);
+            return true;
+        } catch (err) {
+            console.log(`⏳ [${i}/${maxRetries}] Waiting for database... (${err.message})`);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+    console.error('❌ Could not connect to database after retries. Bot will continue without DB.');
+    return false;
+}
+
+const PYTHON_WORKER_URL = process.env.PYTHON_WORKER_URL || 'http://python-worker:5000';
+
+// ============================================================
+// Bot Events
+// ============================================================
+client.once(Events.ClientReady, c => {
+    console.log(`✅ Core Bot Ready! Logged in as ${c.user.tag}`);
+    console.log(`📡 Serving ${c.guilds.cache.size} guild(s)`);
+});
+
+/**
+ * หาห้องที่บอทส่งข้อความได้
+ * ลำดับ: WELCOME_CHANNEL_ID (env) → systemChannel → text channel แรกที่ส่งได้
+ */
+function findWelcomeChannel(guild) {
+    // 1. ใช้ห้องที่กำหนดไว้ใน .env ก่อน
+    const welcomeId = process.env.WELCOME_CHANNEL_ID;
+    if (welcomeId) {
+        const configured = guild.channels.cache.get(welcomeId);
+        if (configured) return configured;
+    }
+
+    // 2. ใช้ systemChannel
+    if (guild.systemChannel) return guild.systemChannel;
+
+    // 3. Fallback: หา text channel แรกที่บอทมีสิทธิ์ส่ง
+    const fallback = guild.channels.cache.find(
+        ch => ch.isTextBased() && !ch.isThread() && ch.permissionsFor(guild.members.me)?.has('SendMessages')
+    );
+    return fallback || null;
+}
+
+// ============================================================
+// Card Image Generator — สร้างรูป Welcome/Goodbye สวยๆ
+// ============================================================
+const WELCOME_BG = path.join(__dirname, 'assets', 'welcome_bg.png');
+const GOODBYE_BG = path.join(__dirname, 'assets', 'goodbye_bg.png');
+
+/**
+ * สร้างรูป Card สำหรับ Welcome หรือ Goodbye
+ * @param {'welcome'|'goodbye'} type - ประเภท card
+ * @param {object} opts - { displayName, tag, memberCount, avatarUrl }
+ * @returns {Promise<Buffer>} PNG buffer
+ */
+async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) {
+    const W = 1000, H = 500;
+    const canvas = createCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+
+    // 1. วาด Background Image
+    try {
+        const bgPath = type === 'welcome' ? WELCOME_BG : GOODBYE_BG;
+        const bg = await loadImage(bgPath);
+        ctx.drawImage(bg, 0, 0, W, H);
+    } catch (err) {
+        // Fallback gradient ถ้าโหลดรูปไม่ได้
+        const gradient = ctx.createLinearGradient(0, 0, W, H);
+        if (type === 'welcome') {
+            gradient.addColorStop(0, '#0a1628');
+            gradient.addColorStop(1, '#1a3a5c');
+        } else {
+            gradient.addColorStop(0, '#4a1942');
+            gradient.addColorStop(1, '#c2185b');
+        }
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, W, H);
+    }
+
+    // 2. Semi-transparent overlay เพื่อให้ text อ่านง่ายขึ้น
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    ctx.fillRect(0, 0, W, H);
+
+    // 3. วาด Avatar ใน Bubble (ฝั่งซ้าย กึ่งกลางแนวตั้ง)
+    const avatarX = 200, avatarY = 250, avatarR = 100;
+    if (avatarUrl) {
+        try {
+            const avatar = await loadImage(avatarUrl);
+
+            // Glow effect รอบ bubble
+            const glowColor = type === 'welcome' ? 'rgba(100, 200, 255, 0.3)' : 'rgba(255, 150, 100, 0.3)';
+            for (let i = 3; i >= 1; i--) {
+                ctx.beginPath();
+                ctx.arc(avatarX, avatarY, avatarR + i * 8, 0, Math.PI * 2);
+                ctx.strokeStyle = glowColor;
+                ctx.lineWidth = 3;
+                ctx.stroke();
+            }
+
+            // Bubble border
+            ctx.beginPath();
+            ctx.arc(avatarX, avatarY, avatarR + 5, 0, Math.PI * 2);
+            ctx.strokeStyle = type === 'welcome' ? 'rgba(150, 220, 255, 0.7)' : 'rgba(255, 180, 150, 0.7)';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // Clip and draw avatar
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(avatarX, avatarY, avatarR, 0, Math.PI * 2);
+            ctx.closePath();
+            ctx.clip();
+            ctx.drawImage(avatar, avatarX - avatarR, avatarY - avatarR, avatarR * 2, avatarR * 2);
+            ctx.restore();
+
+            // Bubble shine highlight
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(avatarX, avatarY, avatarR, 0, Math.PI * 2);
+            ctx.clip();
+            const shine = ctx.createRadialGradient(avatarX - 35, avatarY - 50, 10, avatarX, avatarY, avatarR);
+            shine.addColorStop(0, 'rgba(255, 255, 255, 0.25)');
+            shine.addColorStop(1, 'rgba(255, 255, 255, 0)');
+            ctx.fillStyle = shine;
+            ctx.fillRect(avatarX - avatarR, avatarY - avatarR, avatarR * 2, avatarR * 2);
+            ctx.restore();
+        } catch (err) {
+            console.error('Error loading avatar:', err.message);
+        }
+    }
+
+    // 4. วาด Text หลัก (ฝั่งขวา — เว้นระยะจาก avatar)
+    const textX = 400;
+
+    // Header text
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetX = 2;
+    ctx.shadowOffsetY = 2;
+
+    ctx.font = 'italic 36px sans-serif';
+    ctx.fillStyle = '#ffffff';
+    const headerText = type === 'welcome' ? 'Welcome to the server,' : 'Just left the server,';
+    ctx.fillText(headerText, textX, 140);
+
+    // Username (ชื่อใหญ่)
+    const nameColor = type === 'welcome' ? '#64d2ff' : '#ff9a76';
+    ctx.font = 'bold 60px sans-serif';
+    ctx.fillStyle = nameColor;
+
+    // ตัดชื่อถ้ายาวเกิน
+    let name = displayName;
+    while (ctx.measureText(name).width > W - textX - 60 && name.length > 0) {
+        name = name.slice(0, -1);
+    }
+    if (name !== displayName) name += '…';
+    ctx.fillText(name, textX, 220);
+
+    // Reset shadow
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+
+    // 5. Info box (Member count + tag) — กว้างเต็มพื้นที่ด้านใน
+    const boxX = textX, boxY = 270, boxW = W - textX - 60, boxH = 110;
+    const boxRadius = 16;
+
+    // Rounded rectangle background
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.beginPath();
+    ctx.moveTo(boxX + boxRadius, boxY);
+    ctx.lineTo(boxX + boxW - boxRadius, boxY);
+    ctx.quadraticCurveTo(boxX + boxW, boxY, boxX + boxW, boxY + boxRadius);
+    ctx.lineTo(boxX + boxW, boxY + boxH - boxRadius);
+    ctx.quadraticCurveTo(boxX + boxW, boxY + boxH, boxX + boxW - boxRadius, boxY + boxH);
+    ctx.lineTo(boxX + boxRadius, boxY + boxH);
+    ctx.quadraticCurveTo(boxX, boxY + boxH, boxX, boxY + boxH - boxRadius);
+    ctx.lineTo(boxX, boxY + boxRadius);
+    ctx.quadraticCurveTo(boxX, boxY, boxX + boxRadius, boxY);
+    ctx.closePath();
+    ctx.fill();
+
+    // Border
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Info text — จัดกึ่งกลางใน box
+    ctx.font = 'bold 30px sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`Member #${memberCount}`, boxX + 30, boxY + 48);
+
+    ctx.font = '22px sans-serif';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.fillText(tag, boxX + 30, boxY + 82);
+
+    return canvas.toBuffer('image/png');
+}
+
+// --- Welcome Image ---
+client.on(Events.GuildMemberAdd, async member => {
+    console.log(`👤 Member joined: ${member.user.tag} in ${member.guild.name}`);
+    try {
+        const channel = findWelcomeChannel(member.guild);
+        if (!channel) {
+            console.warn('⚠️ No channel found to send welcome message!');
+            return;
+        }
+        console.log(`📨 Sending welcome image to #${channel.name}`);
+
+        const buffer = await generateCard('welcome', {
+            displayName: member.user.displayName,
+            tag: member.user.tag,
+            memberCount: member.guild.memberCount,
+            avatarUrl: member.user.displayAvatarURL({ extension: 'png', size: 256 }),
+        });
+
+        const attachment = new AttachmentBuilder(buffer, { name: 'welcome.png' });
+        await channel.send({ content: `ยินดีต้อนรับ <@${member.id}>`, files: [attachment] });
+        console.log(`✅ Welcome image sent for ${member.user.tag}`);
+
+    } catch (error) {
+        console.error('Error generating welcome image:', error);
+    }
+});
+
+// --- Goodbye Image ---
+client.on(Events.GuildMemberRemove, async member => {
+    console.log(`👤 Member left: ${member.user.tag} from ${member.guild.name}`);
+    try {
+        const channel = findWelcomeChannel(member.guild);
+        if (!channel) {
+            console.warn('⚠️ No channel found to send goodbye message!');
+            return;
+        }
+
+        const buffer = await generateCard('goodbye', {
+            displayName: member.user.displayName,
+            tag: member.user.tag,
+            memberCount: member.guild.memberCount,
+            avatarUrl: member.user.displayAvatarURL({ extension: 'png', size: 256 }),
+        });
+
+        const attachment = new AttachmentBuilder(buffer, { name: 'goodbye.png' });
+        await channel.send({ content: `<@${member.id}> ออกจากเซิร์ฟไปแล้ว`, files: [attachment] });
+        console.log(`✅ Goodbye image sent for ${member.user.tag}`);
+    } catch (error) {
+        console.error('Error sending goodbye image:', error);
+    }
+});
+
+// --- Commands ---
+client.on(Events.MessageCreate, async message => {
+    if (message.author.bot) return;
+
+    // Weather Command
+    if (message.content.startsWith('!weather')) {
+        const args = message.content.split(' ').slice(1);
+        if (args.length === 0) return message.reply('🌦️ Please provide a city name (e.g., `!weather Bangkok`)');
+
+        const city = args.join(' ');
+        try {
+            const response = await axios.get('http://api.openweathermap.org/data/2.5/weather', {
+                params: {
+                    q: city,
+                    appid: process.env.WEATHER_API_KEY,
+                    units: 'metric'
+                }
+            });
+            const w = response.data;
+            const embed = {
+                color: 0x0099ff,
+                title: `🌤️ Weather in ${w.name}, ${w.sys.country}`,
+                fields: [
+                    { name: '🌡️ Temperature', value: `${w.main.temp}°C (feels like ${w.main.feels_like}°C)`, inline: true },
+                    { name: '💧 Humidity', value: `${w.main.humidity}%`, inline: true },
+                    { name: '💨 Wind', value: `${w.wind.speed} m/s`, inline: true },
+                    { name: '☁️ Condition', value: w.weather[0].description, inline: true },
+                ],
+                timestamp: new Date().toISOString(),
+            };
+            message.reply({ embeds: [embed] });
+        } catch (error) {
+            if (error.response && error.response.status === 404) {
+                message.reply('❌ City not found. Please check the name and try again.');
+            } else {
+                message.reply('⚠️ Could not fetch weather data. Please try again later.');
+            }
+        }
+    }
+
+    // TTS Command (Sending task to Python Worker)
+    if (message.content.startsWith('!tts')) {
+        const text = message.content.replace('!tts', '').trim();
+        if (!text) return message.reply('🔊 Please provide text to speak (e.g., `!tts สวัสดีครับ`)');
+
+        try {
+            await message.channel.sendTyping();
+
+            // Forward request to Python worker
+            const response = await axios.post(`${PYTHON_WORKER_URL}/tts`, { text }, {
+                responseType: 'arraybuffer',
+                timeout: 15000, // 15 second timeout
+            });
+
+            const attachment = new AttachmentBuilder(Buffer.from(response.data), { name: 'tts.mp3' });
+            await message.reply({ files: [attachment] });
+        } catch (error) {
+            console.error('Error communicating with TTS worker:', error.message);
+            if (error.code === 'ECONNREFUSED') {
+                message.reply('⚠️ TTS service is not available. Please try again later.');
+            } else {
+                message.reply('⚠️ An error occurred while generating TTS.');
+            }
+        }
+    }
+
+    // Test Welcome Command
+    if (message.content === '!testwelcome') {
+        try {
+            const channel = findWelcomeChannel(message.guild);
+            if (!channel) return message.reply('⚠️ ไม่พบห้อง Welcome! ตั้งค่า WELCOME_CHANNEL_ID ใน .env');
+
+            const buffer = await generateCard('welcome', {
+                displayName: message.author.displayName,
+                tag: message.author.tag,
+                memberCount: message.guild.memberCount,
+                avatarUrl: message.author.displayAvatarURL({ extension: 'png', size: 256 }),
+            });
+
+            const attachment = new AttachmentBuilder(buffer, { name: 'welcome.png' });
+            await channel.send({ content: `ยินดีต้อนรับ <@${message.author.id}>`, files: [attachment] });
+            if (channel.id !== message.channel.id) {
+                message.reply(`✅ ส่ง Welcome Image ไปที่ <#${channel.id}> แล้ว!`);
+            }
+        } catch (error) {
+            console.error('Error in testwelcome:', error);
+            message.reply('⚠️ Error generating test welcome image.');
+        }
+    }
+
+    // Test Goodbye Command
+    if (message.content === '!testgoodbye') {
+        try {
+            const channel = findWelcomeChannel(message.guild);
+            if (!channel) return message.reply('⚠️ ไม่พบห้อง Welcome! ตั้งค่า WELCOME_CHANNEL_ID ใน .env');
+
+            const buffer = await generateCard('goodbye', {
+                displayName: message.author.displayName,
+                tag: message.author.tag,
+                memberCount: message.guild.memberCount,
+                avatarUrl: message.author.displayAvatarURL({ extension: 'png', size: 256 }),
+            });
+
+            const attachment = new AttachmentBuilder(buffer, { name: 'goodbye.png' });
+            await channel.send({ content: `<@${message.author.id}> ออกจากเซิร์ฟไปแล้ว`, files: [attachment] });
+            if (channel.id !== message.channel.id) {
+                message.reply(`✅ ส่ง Goodbye Image ไปที่ <#${channel.id}> แล้ว!`);
+            }
+        } catch (error) {
+            console.error('Error in testgoodbye:', error);
+            message.reply('⚠️ Error generating test goodbye image.');
+        }
+    }
+
+    // Help Command
+    if (message.content === '!help') {
+        const embed = {
+            color: 0xe94560,
+            title: '📖 Bot Commands',
+            fields: [
+                { name: '!weather <city>', value: 'Get current weather for a city' },
+                { name: '!tts <text>', value: 'Convert text to speech (supports Thai)' },
+                { name: '!testwelcome', value: 'Test the welcome image' },
+                { name: '!testgoodbye', value: 'Test the goodbye image' },
+                { name: '!ping', value: 'Check bot latency' },
+                { name: '!help', value: 'Show this help message' },
+            ],
+            footer: { text: 'Discord Utility Bot v1.0' },
+        };
+        message.reply({ embeds: [embed] });
+    }
+
+    // Ping Command
+    if (message.content === '!ping') {
+        const sent = await message.reply('🏓 Pinging...');
+        sent.edit(`🏓 Pong! Latency: **${sent.createdTimestamp - message.createdTimestamp}ms** | API: **${Math.round(client.ws.ping)}ms**`);
+    }
+});
+
+// ============================================================
+// Startup Sequence — เรียง DB → Discord Login ตามลำดับ
+// ============================================================
+async function start() {
+    console.log('🚀 Starting Discord Utility Bot...');
+
+    // Step 1: Wait for database
+    await waitForDatabase();
+
+    // Step 2: Login to Discord
+    const token = process.env.DISCORD_TOKEN;
+    if (!token) {
+        console.error('❌ DISCORD_TOKEN is not set! Check your .env file.');
+        process.exit(1);
+    }
+
+    try {
+        await client.login(token);
+    } catch (error) {
+        console.error('❌ Failed to login to Discord:', error.message);
+        console.error('   → Check if your DISCORD_TOKEN is correct and not expired.');
+        console.error('   → Make sure you enabled Privileged Gateway Intents in Developer Portal.');
+        process.exit(1);
+    }
+}
+
+start();

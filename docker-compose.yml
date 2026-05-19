@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-botuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-botpassword}
+      POSTGRES_DB: ${DB_NAME:-botdb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - bot-network
+    # Healthcheck — Docker จะรอจนกว่า Postgres จะพร้อมจริงๆ
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-botuser} -d ${DB_NAME:-botdb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    # Limit memory for e2-micro (1GB total)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  node-bot:
+    build: 
+      context: ./node-bot
+    restart: always
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - WEATHER_API_KEY=${WEATHER_API_KEY}
+      - DB_HOST=db
+      - DB_USER=${DB_USER:-botuser}
+      - DB_PASSWORD=${DB_PASSWORD:-botpassword}
+      - DB_NAME=${DB_NAME:-botdb}
+      - PYTHON_WORKER_URL=http://python-worker:5000
+      - WELCOME_CHANNEL_ID=${WELCOME_CHANNEL_ID}
+    depends_on:
+      db:
+        condition: service_healthy
+      python-worker:
+        condition: service_started
+    networks:
+      - bot-network
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  python-worker:
+    build:
+      context: ./python-worker
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - bot-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  pgdata:
+
+networks:
+  bot-network:
+    driver: bridge

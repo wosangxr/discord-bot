@@ -1,0 +1,16 @@
+{
+  "name": "discord-utility-bot",
+  "version": "1.0.0",
+  "description": "Discord Utility Bot with Canvas and Weather",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "canvas": "^2.11.2",
+    "discord.js": "^14.14.1",
+    "pg": "^8.11.3"
+  }
+}

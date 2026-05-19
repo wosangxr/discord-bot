@@ -124,44 +124,27 @@ async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) 
         // Fallback gradient ถ้าโหลดรูปไม่ได้
         const gradient = ctx.createLinearGradient(0, 0, W, H);
         if (type === 'welcome') {
-            gradient.addColorStop(0, '#0a1628');
-            gradient.addColorStop(1, '#1a3a5c');
+            gradient.addColorStop(0, '#1a0533');
+            gradient.addColorStop(1, '#2d1b69');
         } else {
-            gradient.addColorStop(0, '#4a1942');
-            gradient.addColorStop(1, '#c2185b');
+            gradient.addColorStop(0, '#87CEEB');
+            gradient.addColorStop(1, '#b0d4f1');
         }
         ctx.fillStyle = gradient;
         ctx.fillRect(0, 0, W, H);
     }
 
-    // 2. Semi-transparent overlay เพื่อให้ text อ่านง่ายขึ้น
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
-    ctx.fillRect(0, 0, W, H);
+    // 2. ตำแหน่ง Avatar — จัดให้ตรงกับกรอบวงกลมในรูป Background
+    // Welcome: วงกลมเงินอยู่กลาง-บน | Goodbye: วงกลมขาวอยู่กลาง-บน
+    const avatarX = type === 'welcome' ? 500 : 500;
+    const avatarY = type === 'welcome' ? 175 : 170;
+    const avatarR = type === 'welcome' ? 80 : 90;
 
-    // 3. วาด Avatar ใน Bubble (ฝั่งซ้าย กึ่งกลางแนวตั้ง)
-    const avatarX = 200, avatarY = 250, avatarR = 100;
     if (avatarUrl) {
         try {
             const avatar = await loadImage(avatarUrl);
 
-            // Glow effect รอบ bubble
-            const glowColor = type === 'welcome' ? 'rgba(100, 200, 255, 0.3)' : 'rgba(255, 150, 100, 0.3)';
-            for (let i = 3; i >= 1; i--) {
-                ctx.beginPath();
-                ctx.arc(avatarX, avatarY, avatarR + i * 8, 0, Math.PI * 2);
-                ctx.strokeStyle = glowColor;
-                ctx.lineWidth = 3;
-                ctx.stroke();
-            }
-
-            // Bubble border
-            ctx.beginPath();
-            ctx.arc(avatarX, avatarY, avatarR + 5, 0, Math.PI * 2);
-            ctx.strokeStyle = type === 'welcome' ? 'rgba(150, 220, 255, 0.7)' : 'rgba(255, 180, 150, 0.7)';
-            ctx.lineWidth = 3;
-            ctx.stroke();
-
-            // Clip and draw avatar
+            // Clip and draw avatar ให้อยู่ในกรอบวงกลมของ background
             ctx.save();
             ctx.beginPath();
             ctx.arc(avatarX, avatarY, avatarR, 0, Math.PI * 2);
@@ -170,13 +153,25 @@ async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) 
             ctx.drawImage(avatar, avatarX - avatarR, avatarY - avatarR, avatarR * 2, avatarR * 2);
             ctx.restore();
 
+            // Subtle glow รอบ avatar ให้กลมกลืนกับกรอบ
+            if (type === 'welcome') {
+                // Glow สีม่วง-เงิน ให้เข้ากับธีม
+                for (let i = 3; i >= 1; i--) {
+                    ctx.beginPath();
+                    ctx.arc(avatarX, avatarY, avatarR + i * 4, 0, Math.PI * 2);
+                    ctx.strokeStyle = `rgba(200, 180, 255, ${0.15 / i})`;
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+            }
+
             // Bubble shine highlight
             ctx.save();
             ctx.beginPath();
             ctx.arc(avatarX, avatarY, avatarR, 0, Math.PI * 2);
             ctx.clip();
-            const shine = ctx.createRadialGradient(avatarX - 35, avatarY - 50, 10, avatarX, avatarY, avatarR);
-            shine.addColorStop(0, 'rgba(255, 255, 255, 0.25)');
+            const shine = ctx.createRadialGradient(avatarX - 25, avatarY - 35, 10, avatarX, avatarY, avatarR);
+            shine.addColorStop(0, 'rgba(255, 255, 255, 0.2)');
             shine.addColorStop(1, 'rgba(255, 255, 255, 0)');
             ctx.fillStyle = shine;
             ctx.fillRect(avatarX - avatarR, avatarY - avatarR, avatarR * 2, avatarR * 2);
@@ -186,32 +181,32 @@ async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) 
         }
     }
 
-    // 4. วาด Text หลัก (ฝั่งขวา — เว้นระยะจาก avatar)
-    const textX = 400;
+    // 3. วาด Text — จัดกลางด้านล่าง avatar
+    ctx.textAlign = 'center';
 
-    // Header text
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
-    ctx.shadowBlur = 10;
+    // Text shadow
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+    ctx.shadowBlur = 12;
     ctx.shadowOffsetX = 2;
     ctx.shadowOffsetY = 2;
 
-    ctx.font = 'italic 36px sans-serif';
-    ctx.fillStyle = '#ffffff';
-    const headerText = type === 'welcome' ? 'Welcome to the server,' : 'Just left the server,';
-    ctx.fillText(headerText, textX, 140);
-
     // Username (ชื่อใหญ่)
-    const nameColor = type === 'welcome' ? '#64d2ff' : '#ff9a76';
-    ctx.font = 'bold 60px sans-serif';
+    const nameColor = type === 'welcome' ? '#e0c0ff' : '#ffffff';
+    ctx.font = 'bold 48px sans-serif';
     ctx.fillStyle = nameColor;
 
     // ตัดชื่อถ้ายาวเกิน
     let name = displayName;
-    while (ctx.measureText(name).width > W - textX - 60 && name.length > 0) {
+    while (ctx.measureText(name).width > W - 100 && name.length > 0) {
         name = name.slice(0, -1);
     }
     if (name !== displayName) name += '…';
-    ctx.fillText(name, textX, 220);
+    ctx.fillText(name, W / 2, 340);
+
+    // Tag (ชื่อเล็ก)
+    ctx.font = '24px sans-serif';
+    ctx.fillStyle = type === 'welcome' ? 'rgba(200, 180, 255, 0.8)' : 'rgba(255, 255, 255, 0.7)';
+    ctx.fillText(tag, W / 2, 375);
 
     // Reset shadow
     ctx.shadowColor = 'transparent';
@@ -219,12 +214,13 @@ async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) 
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
 
-    // 5. Info box (Member count + tag) — กว้างเต็มพื้นที่ด้านใน
-    const boxX = textX, boxY = 270, boxW = W - textX - 60, boxH = 110;
-    const boxRadius = 16;
+    // 4. Info box — Member count จัดกลางด้านล่างสุด
+    const boxW = 280, boxH = 50;
+    const boxX = (W - boxW) / 2, boxY = 400;
+    const boxRadius = 25;
 
-    // Rounded rectangle background
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    // Rounded pill background
+    ctx.fillStyle = type === 'welcome' ? 'rgba(100, 60, 180, 0.4)' : 'rgba(255, 255, 255, 0.25)';
     ctx.beginPath();
     ctx.moveTo(boxX + boxRadius, boxY);
     ctx.lineTo(boxX + boxW - boxRadius, boxY);
@@ -239,18 +235,18 @@ async function generateCard(type, { displayName, tag, memberCount, avatarUrl }) 
     ctx.fill();
 
     // Border
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = type === 'welcome' ? 'rgba(200, 180, 255, 0.3)' : 'rgba(255, 255, 255, 0.3)';
+    ctx.lineWidth = 1;
     ctx.stroke();
 
-    // Info text — จัดกึ่งกลางใน box
-    ctx.font = 'bold 30px sans-serif';
+    // Member count text
+    ctx.font = 'bold 24px sans-serif';
     ctx.fillStyle = '#ffffff';
-    ctx.fillText(`Member #${memberCount}`, boxX + 30, boxY + 48);
+    ctx.textAlign = 'center';
+    ctx.fillText(`Member #${memberCount}`, W / 2, boxY + 33);
 
-    ctx.font = '22px sans-serif';
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-    ctx.fillText(tag, boxX + 30, boxY + 82);
+    // Reset textAlign
+    ctx.textAlign = 'left';
 
     return canvas.toBuffer('image/png');
 }
